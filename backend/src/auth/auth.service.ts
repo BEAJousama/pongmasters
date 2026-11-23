@@ -1,0 +1,309 @@
+import {
+  Injectable,
+  InternalServerErrorException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { User } from '@prisma/client';
+import { Request, Response } from 'express';
+import { authenticator } from 'otplib';
+import { UsersService } from 'src/users/users.service';
+import { SignUpDto } from './dto/signup.dto';
+import { SignInDto } from './dto/signin.dto';
+import * as bcrypt from 'bcryptjs';
+import { randomBytes } from 'crypto';
+import { getFrontendUrl, withQuery } from './frontend-url';
+
+export const AUTH_COOKIES = ['access_token', '2fa_access_token', 'complete_info'];
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private jwtService: JwtService,
+    private usersService: UsersService,
+  ) {}
+
+  // The frontend owns the session cookies (set from the redirect query or the
+  // response body). Cookies set here would live on the API host, where the
+  // frontend cannot clear them, and would keep users signed in after logout.
+  logout(res: Response) {
+    for (const name of AUTH_COOKIES) res.clearCookie(name, { path: '/' });
+    return { message: 'success' };
+  }
+
+  // OAuth hand-off: the callback redirects with a short-lived, single-use code
+  // instead of the JWT itself, so tokens never appear in URLs (history, logs,
+  // Referer). The frontend trades the code for the tokens via POST /auth/exchange.
+  private static readonly CODE_TTL_MS = 60_000;
+  private oauthCodes = new Map<string, { params: Record<string, string>; expires: number }>();
+
+  private redirectWithCode(res: Response, params: Record<string, string>) {
+    const now = Date.now();
+    for (const [k, v] of this.oauthCodes) if (v.expires < now) this.oauthCodes.delete(k);
+    const code = randomBytes(32).toString('base64url');
+    this.oauthCodes.set(code, { params, expires: now + AuthService.CODE_TTL_MS });
+    res.redirect(withQuery(`${getFrontendUrl()}/auth/callback`, { code }));
+  }
+
+  exchangeCode(code: string): Record<string, string> {
+    const entry = typeof code === 'string' ? this.oauthCodes.get(code) : undefined;
+    if (entry) this.oauthCodes.delete(code);
+    if (!entry || entry.expires < Date.now()) {
+      throw new UnauthorizedException('Invalid or expired login code');
+    }
+    return entry.params;
+  }
+
+  private accessToken: {
+    name: string;
+    value: string;
+  };
+
+  async hashPassword(password: string): Promise<string> {
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    return hashedPassword;
+  }
+
+  async verifyPassword(
+    password: string,
+    hashedPassword: string,
+  ): Promise<boolean> {
+    const isMatch = await bcrypt.compare(password, hashedPassword);
+    return isMatch;
+  }
+
+  async signUp(body: SignUpDto) {
+    try {
+      const secret = authenticator.generateSecret();
+
+      const password: string = await this.hashPassword(body.password);
+      const user = await this.usersService.createUser({
+        login: body.username,
+        avatar: '/img/default.jpg',
+        tfaSecret: secret,
+        fullname: body.fullname,
+        phone: '',
+        email: body.email,
+        password: password,
+      });
+      return this.signIn({ username: body.username, password: body.password });
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async signIn(body: SignInDto) {
+    try {
+      const user = await this.usersService.findUserByLogin(body.username);
+      if (!user) {
+        throw new UnauthorizedException('Incorrect username or password');
+      }
+      const isMatch = await this.verifyPassword(body.password, user.password);
+      if (!isMatch) {
+        throw new UnauthorizedException('Incorrect username or password');
+      }
+      if (user.twoFactorAuth === true) {
+        const payload = { login: user.login, sub: user.id };
+        const access_token = this.jwtService.sign(payload, {
+          secret: process.env.TFA_JWT_SECRET,
+          expiresIn: '24h',
+        });
+
+        return {
+          name: '2fa_access_token',
+          value: access_token,
+        };
+      }
+      const payload = { login: user.login, sub: user.id, email: user.email };
+      const access_token = this.jwtService.sign(payload, {
+        secret: process.env.JWT_SECRET,
+        expiresIn: '7d',
+      });
+      return {
+        name: 'access_token',
+        value: access_token,
+      };
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async getprofile(login: string) {
+    try {
+      let user = await this.usersService.findUserByLogin(login);
+      return user;
+    } catch (error) {
+      throw new InternalServerErrorException(
+        'An internal server error occurred.',
+      );
+    }
+  }
+
+  async callback(req, res) {
+    try {
+      if (!req.user) {
+        res.redirect(getFrontendUrl());
+        return;
+      }
+      const data = req.user;
+      let user: User = await this.usersService.findUserByLogin(data.login);
+      if (!user) {
+        const secret = authenticator.generateSecret();
+        user = await this.usersService.createUser({
+          login: data.login,
+          avatar: data.avatar,
+          tfaSecret: secret,
+          fullname: data.fullname,
+          phone: data.phone,
+          email: data.email,
+        });
+      }
+
+      if (user.twoFactorAuth === true) {
+        const payload = { login: user.login, sub: user.id };
+        const access_token = this.jwtService.sign(payload, {
+          secret: process.env.TFA_JWT_SECRET,
+          expiresIn: '24h',
+        });
+
+        this.logout(res);
+        this.redirectWithCode(res, { '2fa_access_token': access_token });
+        return;
+      }
+
+      const payload = { login: user.login, sub: user.id, email: user.email };
+      const access_token = this.jwtService.sign(payload, {
+        secret: process.env.JWT_SECRET,
+        expiresIn: '7d',
+      });
+      const params: Record<string, string> = { access_token };
+      if (Math.abs(user.createdAt.getTime() - user.updatedAt.getTime()) <= 1500) {
+        params.complete_info = 'complete_your_info';
+      }
+      this.logout(res);
+      this.redirectWithCode(res, params);
+      return;
+    } catch (error: any) {
+      throw new InternalServerErrorException(
+        error?.response?.message ?? 'An internal server error occurred.',
+      );
+    }
+  }
+
+  async turnOnTwoFactorAuthentication(req) {
+    try {
+      const user = await this.usersService.findUserByLogin(req.user.login);
+      const isvalid = await this.verifyTwoFactorAuthentication(
+        req.body.code,
+        user,
+      );
+      if (isvalid && user) {
+        await this.usersService.updateUser({
+          user: {
+            twoFactorAuth: true,
+          },
+          id: user.id,
+        });
+        return {
+          message: 'success',
+        };
+      }
+
+      return {
+        message: 'fail',
+      };
+    } catch (error) {
+      throw new InternalServerErrorException(
+        'An internal server error occurred.',
+      );
+    }
+  }
+
+  async turnOffTwoFactorAuthentication(req) {
+    try {
+      const user = await this.usersService.findUserByLogin(req.user.login);
+      const isvalid = await this.verifyTwoFactorAuthentication(
+        req.body.code,
+        user,
+      );
+      if (isvalid && user) {
+        await this.usersService.updateUser({
+          user: {
+            twoFactorAuth: false,
+          },
+          id: user.id,
+        });
+        return {
+          message: 'success',
+        };
+      }
+      return {
+        message: 'fail',
+      };
+    } catch (error) {
+      throw new InternalServerErrorException(
+        'An internal server error occurred.',
+      );
+    }
+  }
+
+  async verify(req, res) {
+    try {
+      const user = await this.getprofile(req.user.login);
+
+      const { code } = req.body;
+
+      const isvalid = this.verifyTwoFactorAuthentication(code, user);
+
+      if (isvalid === true) {
+        const payload = { login: user.login, sub: user.id };
+        const access_token = this.jwtService.sign(payload, {
+          secret: process.env.JWT_SECRET,
+          expiresIn: '7d',
+        });
+
+        return {
+          message: 'success',
+          name: 'access_token',
+          value: access_token,
+        };
+      }
+      throw new UnauthorizedException('Invalid credentials');
+    } catch (error) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+  }
+
+  verifyTwoFactorAuthentication(twoFactorAuthenticationCode: string, user) {
+    try {
+      if (!user || !user.tfaSecret || !twoFactorAuthenticationCode)
+        return false;
+
+      return authenticator.verify({
+        token: twoFactorAuthenticationCode,
+        secret: user.tfaSecret,
+      });
+    } catch (error) {
+      throw new InternalServerErrorException(
+        'An internal server error occurred.',
+      );
+    }
+  }
+
+  async generateQrCodeDataUrl(login: string) {
+    try {
+      const user = await this.getprofile(login);
+      const otpauthUrl = authenticator.keyuri(
+        user.login,
+        'FT_TRANSCENDENCE',
+        user.tfaSecret,
+      );
+      return otpauthUrl;
+    } catch (error) {
+      throw new InternalServerErrorException(
+        'An internal server error occurred.',
+      );
+    }
+  }
+}

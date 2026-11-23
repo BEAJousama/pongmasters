@@ -1,0 +1,80 @@
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ["Inter", "system-ui", "sans-serif"],
+        montserrat: ["Montserrat"],
+        lato: ["Lato"],
+        garamond: ["Garamond"],
+      },
+      colors: {
+        primary: {
+          50: "#ECFDF5",
+          100: "#D1FAE5",
+          200: "#A7F3D0",
+          300: "#34D399",
+          400: "#34D399",
+          500: "#10B981",
+          600: "#059669",
+          700: "#047857",
+          800: "#065F46",
+          900: "#064E3B",
+        },
+        secondary: {
+          50: "#F8FAFC",
+          100: "#E2E8F0",
+          200: "#CBD5E1",
+          300: "#94A3B8",
+          400: "#64748B",
+          500: "#2A2F3E",
+          600: "#232838",
+          700: "#1A1F2E",
+          800: "#141824",
+          900: "#0C0F1A",
+        },
+        tertiary: {
+          50: "#F8FAFC",
+          100: "#E2E8F0",
+          200: "#CBD5E1",
+          300: "#94A3B8",
+          400: "#64748B",
+          500: "#3F4F68",
+          600: "#334155",
+          700: "#1E293B",
+          800: "#0F172A",
+          900: "#020617",
+        },
+        quaternary: {
+          50: "#DCDCDC",
+          100: "#C5C5C5",
+          200: "#A8A8A8",
+          300: "#8C8C8C",
+          400: "#6F6F6F",
+          500: "#525252",
+          600: "#444444",
+          700: "#373737",
+          800: "#292929",
+          900: "#1B1B1B",
+        },
+      },
+      borderRadius: {
+        "4xl": "2rem",
+      },
+      boxShadow: {
+        glow: "0 0 20px rgba(52,211,153,0.15)",
+        "glow-lg": "0 0 40px rgba(52,211,153,0.1)",
+      },
+    },
+  },
+  plugins: [
+    require("prettier-plugin-tailwindcss"),
+    require("tailwind-scrollbar-hide"),
+    require("tailwindcss-animated"),
+  ],
+};
